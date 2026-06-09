@@ -77,3 +77,319 @@ def scrape_google_flights(origin: str) -> list[Flight]:
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+            timezone_id="America/Argentina/Buenos_Aires",
+        )
+
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+
+        page = context.new_page()
+
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            time.sleep(random.uniform(3, 5))
+
+            selectors = [
+                "[data-gs]",
+                ".YMlIz",
+                "[jsname='IWWDBc']",
+                "li[data-gs]",
+            ]
+
+            loaded = False
+            for selector in selectors:
+                try:
+                    page.wait_for_selector(selector, timeout=20_000)
+                    log.info(f"  → Resultados cargados con selector: {selector}")
+                    loaded = True
+                    break
+                except PlaywrightTimeout:
+                    continue
+
+            if not loaded:
+                log.warning(f"  → No se cargaron resultados para {origin}. Guardando HTML.")
+                with open(f"debug_{origin}.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                return flights
+
+            page.evaluate("window.scrollTo(0, 600)")
+            time.sleep(random.uniform(1, 2))
+
+            flights = parse_google_flights(page, origin, url)
+            log.info(f"  → {len(flights)} vuelos encontrados para {origin}")
+
+        except PlaywrightTimeout:
+            log.warning(f"  → Timeout general para {origin}.")
+            with open(f"debug_{origin}.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+        except Exception as e:
+            log.error(f"  → Error scraping {origin}: {e}")
+        finally:
+            browser.close()
+
+    return flights
+
+
+def parse_google_flights(page, origin: str, url: str) -> list[Flight]:
+    flights = []
+    now = datetime.utcnow().isoformat()
+
+    flight_items = page.query_selector_all("li[data-gs]")
+
+    if not flight_items:
+        flight_items = page.query_selector_all("[jsname='IWWDBc'] li")
+
+    if not flight_items:
+        log.warning(f"  → No se encontraron items de vuelo para {origin}.")
+        with open(f"debug_{origin}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        return flights
+
+    log.info(f"  → {len(flight_items)} items de vuelo encontrados")
+
+    for item in flight_items[:15]:
+        try:
+            full_text = item.inner_text()
+            if not full_text.strip():
+                continue
+
+            price = extract_price_from_text(full_text)
+            if price is None:
+                continue
+
+            lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+            airline = lines[0] if lines else "–"
+
+            duration = "–"
+            for line in lines:
+                if "hr" in line or "min" in line:
+                    duration = line
+                    break
+
+            stops = "–"
+            for line in lines:
+                if "stop" in line.lower() or "nonstop" in line.lower() or "direct" in line.lower():
+                    stops = line
+                    break
+
+            flights.append(Flight(
+                origin=origin,
+                destination=DESTINATION,
+                departure_date=DEPARTURE_DATE,
+                return_date=RETURN_DATE,
+                price_usd=price,
+                airline=airline,
+                stops=stops,
+                duration=duration,
+                url=url,
+                scraped_at=now,
+            ))
+
+        except Exception as e:
+            log.debug(f"  → Error parseando item: {e}")
+            continue
+
+    return flights
+
+
+def extract_price_from_text(text: str) -> Optional[float]:
+    import re
+    patterns = [
+        r'USD\s*([\d,]+)',
+        r'\$\s*([\d,]+)',
+        r'([\d,]+)\s*USD',
+        r'\b([1-9][\d]{2,3})\b',
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        for match in matches:
+            try:
+                value = float(match.replace(",", ""))
+                if 200 <= value <= 5000:
+                    return value
+            except ValueError:
+                continue
+    return None
+
+# ─── Notificaciones Gmail ─────────────────────────────────────────────────────
+
+def send_email(subject: str, body_html: str) -> bool:
+    if not GMAIL_SENDER or not GMAIL_PASSWORD or not EMAIL_RECIPIENTS:
+        log.warning("Faltan credenciales de Gmail. Saltando envío.")
+        return False
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = GMAIL_SENDER
+        msg["To"]      = ", ".join(EMAIL_RECIPIENTS)
+        msg.attach(MIMEText(body_html, "html", "utf-8"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
+            server.sendmail(GMAIL_SENDER, EMAIL_RECIPIENTS, msg.as_string())
+        log.info(f"  ✓ Email enviado a: {', '.join(EMAIL_RECIPIENTS)}")
+        return True
+    except Exception as e:
+        log.error(f"  ✗ Error enviando email: {e}")
+        return False
+
+
+def format_email_html(flights: list[Flight]) -> tuple[str, str]:
+    best_price = min(f.price_usd for f in flights)
+    subject = f"✈️ Vuelo BUE→MAD desde USD {best_price:,.0f} — ¡Oferta encontrada!"
+
+    rows = ""
+    for f in flights[:5]:
+        rows += f"""
+        <tr>
+          <td style="padding:10px;border-bottom:1px solid #eee;">{f.origin} → {f.destination}</td>
+          <td style="padding:10px;border-bottom:1px solid #eee;font-weight:bold;color:#1a7f37;">USD {f.price_usd:,.0f}</td>
+          <td style="padding:10px;border-bottom:1px solid #eee;">{f.airline}</td>
+          <td style="padding:10px;border-bottom:1px solid #eee;">{f.stops}</td>
+          <td style="padding:10px;border-bottom:1px solid #eee;">{f.duration}</td>
+          <td style="padding:10px;border-bottom:1px solid #eee;"><a href="{f.url}" style="color:#0066cc;">Ver en Google Flights</a></td>
+        </tr>"""
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;">
+      <h2 style="color:#1a1a2e;">✈️ Alerta de vuelo barato — BUE → MAD</h2>
+      <p style="color:#555;">
+        Ida: <strong>{DEPARTURE_DATE}</strong> &nbsp;|&nbsp;
+        Vuelta: <strong>{RETURN_DATE}</strong> &nbsp;|&nbsp;
+        Umbral: <strong>USD {PRICE_THRESHOLD_USD:,.0f}</strong>
+      </p>
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        <thead>
+          <tr style="background:#f0f4ff;">
+            <th style="padding:10px;text-align:left;">Ruta</th>
+            <th style="padding:10px;text-align:left;">Precio</th>
+            <th style="padding:10px;text-align:left;">Aerolínea</th>
+            <th style="padding:10px;text-align:left;">Escalas</th>
+            <th style="padding:10px;text-align:left;">Duración</th>
+            <th style="padding:10px;text-align:left;">Link</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <p style="color:#999;font-size:12px;margin-top:20px;">
+        Fuente: Google Flights | Scrapeado: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+      </p>
+    </div>
+    """
+    return subject, html
+
+
+def notify_all(flights: list[Flight]):
+    if not flights:
+        return
+    subject, html = format_email_html(flights)
+    log.info(f"Enviando alerta: {len(flights)} vuelo(s) bajo umbral.")
+    send_email(subject, html)
+
+# ─── Log persistente ──────────────────────────────────────────────────────────
+
+def save_to_log(flights: list[Flight]):
+    existing = []
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "r") as f:
+                existing = json.load(f)
+        except json.JSONDecodeError:
+            pass
+    existing.extend([asdict(f) for f in flights])
+    existing = existing[-500:]
+    with open(LOG_FILE, "w") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+    log.info(f"Log actualizado: {len(existing)} registros en {LOG_FILE}")
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+def main():
+    log.info("=" * 60)
+    log.info(f"Iniciando scraper | {datetime.utcnow().isoformat()} UTC")
+    log.info(f"Ruta: BUE → {DESTINATION} | {DEPARTURE_DATE} → {RETURN_DATE}")
+    log.info(f"Umbral: USD {PRICE_THRESHOLD_USD:,.0f}")
+    log.info("=" * 60)
+
+    all_cheap_flights = []
+
+    for origin in ORIGINS:
+        flights = scrape_google_flights(origin)
+        cheap = [f for f in flights if f.price_usd < PRICE_THRESHOLD_USD]
+        log.info(f"{origin}: {len(cheap)}/{len(flights)} vuelos bajo USD {PRICE_THRESHOLD_USD:,.0f}")
+        all_cheap_flights.extend(cheap)
+
+        if origin != ORIGINS[-1]:
+            wait = random.uniform(5, 10)
+            log.info(f"Esperando {wait:.1f}s antes del siguiente origen...")
+            time.sleep(wait)
+
+    all_cheap_flights.sort(key=lambda f: f.price_usd)
+
+    if all_cheap_flights:
+        log.info(f"🎯 ¡{len(all_cheap_flights)} vuelo(s) bajo umbral encontrado(s)!")
+        notify_all(all_cheap_flights)
+        save_to_log(all_cheap_flights)
+    else:
+        log.info("Sin ofertas bajo umbral en esta corrida.")
+
+    log.info("Scraper finalizado.")
+
+
+if __name__ == "__main__":
+    main()
+LOG_FILE = "flights_log.json"
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+log = logging.getLogger(__name__)
+
+# ─── Modelo de datos ──────────────────────────────────────────────────────────
+
+@dataclass
+class Flight:
+    origin: str
+    destination: str
+    departure_date: str
+    return_date: str
+    price_usd: float
+    airline: str
+    stops: str
+    duration: str
+    url: str
+    scraped_at: str
+
+# ─── Scraper ──────────────────────────────────────────────────────────────────
+
+def scrape_google_flights(origin: str) -> list[Flight]:
+    url = f"https://www.google.com/flights?hl=en&curr=USD#flt={origin}.MAD.{DEPARTURE_DATE}*MAD.{origin}.{RETURN_DATE};c:USD;e:1;sd:1;t:f"
+
+    log.info(f"Scraping Google Flights {origin} → {DESTINATION}")
+    log.info(f"URL: {url}")
+    flights = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
