@@ -24,9 +24,12 @@ PRICE_THRESHOLD_USD = float(os.getenv("PRICE_THRESHOLD", "1000"))
 DEPARTURE_DATE = os.getenv("DEPARTURE_DATE", "2026-08-19")
 RETURN_DATE    = os.getenv("RETURN_DATE",    "2026-09-06")
 
+# Google Flights usa códigos de ciudad, no aeropuerto
+# BUE = Buenos Aires (ambos aeropuertos), MAD = Madrid
 ORIGINS = ["EZE", "AEP"]
 DESTINATION = "MAD"
 
+# Gmail
 GMAIL_SENDER     = os.getenv("GMAIL_SENDER", "")
 GMAIL_PASSWORD   = os.getenv("GMAIL_PASSWORD", "")
 EMAIL_RECIPIENTS = [
@@ -61,9 +64,60 @@ class Flight:
     url: str
     scraped_at: str
 
+# ─── URL builder ──────────────────────────────────────────────────────────────
+
+def build_url(origin: str) -> str:
+    """
+    Google Flights URL para round-trip.
+    Formato: /flights/search?tfs=...
+    Usamos la URL directa con parámetros legibles.
+    """
+    # Convertir fechas de YYYY-MM-DD a formato Google (YYYY-MM-DD es igual)
+    dep = DEPARTURE_DATE
+    ret = RETURN_DATE
+    # URL de Google Flights para round-trip
+    url = (
+        f"https://www.google.com/travel/flights/search?"
+        f"tfs=CBwQAhoeEgoyMDI2LTA4LTE5agcIARIDRVpFcgcIARIDTUFEGh4SCjIwMjYtMDktMDZqBwgBEgNNQURyBwgBEgNFWkUoAUABSAE"
+    )
+    # URL más simple y legible que Google también acepta
+    url = (
+        f"https://www.google.com/travel/flights?"
+        f"q=flights+from+{origin}+to+{DESTINATION}+"
+        f"{dep}+return+{ret}"
+    )
+    return url
+
+def build_direct_url(origin: str) -> str:
+    """URL directa de Google Flights con parámetros estructurados."""
+    dep = DEPARTURE_DATE.replace("-", "")  # 20260819
+    ret = RETURN_DATE.replace("-", "")     # 20260906
+    # Google Flights acepta esta estructura de URL
+    url = (
+        f"https://www.google.com/flights#flt="
+        f"{origin}.{DESTINATION}.{DEPARTURE_DATE}*"
+        f"{DESTINATION}.{origin}.{RETURN_DATE};c:USD;e:1;sd:1;t:f"
+    )
+    return url
+
 # ─── Scraper ──────────────────────────────────────────────────────────────────
 
 def scrape_google_flights(origin: str) -> list[Flight]:
+    # URL canónica de Google Flights para round-trip
+    url = (
+        f"https://www.google.com/travel/flights/search?"
+        f"tfs=CBwQAhoqEgoyMDI2LTA4LTE5KAFqBwgBEgN"
+        f"{origin}yBwgBEgNNQUQaKhIKMjAyNi0wOS0wNigBagcIARIDTUFEcgcIARID"
+        f"{origin}SAFAAWoCVVNE"
+    )
+    # URL más robusta usando el formato de búsqueda de texto
+    url = (
+        f"https://www.google.com/travel/flights?"
+        f"hl=en&gl=us&curr=USD"
+        f"&tfs=CBwQAhoqEgoyMDI2LTA4LTE5agcIARID{origin}yBwgBEgNNQUQ"
+        f"aKhIKMjAyNi0wOS0wNmoHCAESA01BRHIHARID{origin}SAFIAUABSAE"
+    )
+    # La URL más simple que funciona consistentemente
     url = f"https://www.google.com/flights?hl=en&curr=USD#flt={origin}.MAD.{DEPARTURE_DATE}*MAD.{origin}.{RETURN_DATE};c:USD;e:1;sd:1;t:f"
 
     log.info(f"Scraping Google Flights {origin} → {DESTINATION}")
@@ -103,11 +157,13 @@ def scrape_google_flights(origin: str) -> list[Flight]:
             page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             time.sleep(random.uniform(3, 5))
 
+            # Esperar a que carguen los resultados de vuelos
+            # Google Flights usa varios selectores posibles
             selectors = [
-                "[data-gs]",
-                ".YMlIz",
-                "[jsname='IWWDBc']",
-                "li[data-gs]",
+                "[data-gs]",           # contenedor de vuelo con data
+                ".YMlIz",              # precio en Google Flights
+                "[jsname='IWWDBc']",   # lista de resultados
+                "li[data-gs]",         # item de vuelo
             ]
 
             loaded = False
@@ -126,6 +182,7 @@ def scrape_google_flights(origin: str) -> list[Flight]:
                     f.write(page.content())
                 return flights
 
+            # Scroll para cargar más resultados
             page.evaluate("window.scrollTo(0, 600)")
             time.sleep(random.uniform(1, 2))
 
@@ -148,9 +205,14 @@ def parse_google_flights(page, origin: str, url: str) -> list[Flight]:
     flights = []
     now = datetime.utcnow().isoformat()
 
+    # Google Flights renderiza vuelos en li elements con data-gs attribute
+    # Intentar múltiples estrategias de extracción
+
+    # Estrategia 1: buscar por el atributo data-gs (contiene datos del vuelo)
     flight_items = page.query_selector_all("li[data-gs]")
 
     if not flight_items:
+        # Estrategia 2: buscar contenedores de precio directamente
         flight_items = page.query_selector_all("[jsname='IWWDBc'] li")
 
     if not flight_items:
@@ -167,19 +229,23 @@ def parse_google_flights(page, origin: str, url: str) -> list[Flight]:
             if not full_text.strip():
                 continue
 
+            # Extraer precio — Google muestra "USD 850" o "$850" o "850"
             price = extract_price_from_text(full_text)
             if price is None:
                 continue
 
+            # Extraer aerolínea (primera línea suele ser la aerolínea)
             lines = [l.strip() for l in full_text.split("\n") if l.strip()]
             airline = lines[0] if lines else "–"
 
+            # Buscar duración (formato "14 hr 30 min" o similar)
             duration = "–"
             for line in lines:
                 if "hr" in line or "min" in line:
                     duration = line
                     break
 
+            # Buscar escalas
             stops = "–"
             for line in lines:
                 if "stop" in line.lower() or "nonstop" in line.lower() or "direct" in line.lower():
@@ -207,12 +273,14 @@ def parse_google_flights(page, origin: str, url: str) -> list[Flight]:
 
 
 def extract_price_from_text(text: str) -> Optional[float]:
+    """Extrae el precio USD del texto completo de un resultado de vuelo."""
     import re
+    # Patrones comunes en Google Flights
     patterns = [
-        r'USD\s*([\d,]+)',
-        r'\$\s*([\d,]+)',
-        r'([\d,]+)\s*USD',
-        r'\b([1-9][\d]{2,3})\b',
+        r'USD\s*([\d,]+)',           # USD 1,234
+        r'\$\s*([\d,]+)',            # $1,234
+        r'([\d,]+)\s*USD',           # 1,234 USD
+        r'\b([1-9][\d]{2,3})\b',    # número de 3-4 dígitos standalone
     ]
     for pattern in patterns:
         matches = re.findall(pattern, text)
@@ -224,6 +292,28 @@ def extract_price_from_text(text: str) -> Optional[float]:
             except ValueError:
                 continue
     return None
+
+
+def parse_price(text: str) -> Optional[float]:
+    if not text:
+        return None
+    import re
+    cleaned = re.sub(r'[^\d.,]', '', text).strip()
+    if "." in cleaned and "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "," in cleaned and "." not in cleaned:
+        cleaned = cleaned.replace(",", ".")
+    elif "." in cleaned and cleaned.count(".") == 1:
+        parts = cleaned.split(".")
+        if len(parts[1]) == 3:
+            cleaned = cleaned.replace(".", "")
+    try:
+        value = float(cleaned)
+        if 200 <= value <= 5000:
+            return value
+        return None
+    except ValueError:
+        return None
 
 # ─── Notificaciones Gmail ─────────────────────────────────────────────────────
 
@@ -351,45 +441,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-LOG_FILE = "flights_log.json"
-
-# ─── Logging ──────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-log = logging.getLogger(__name__)
-
-# ─── Modelo de datos ──────────────────────────────────────────────────────────
-
-@dataclass
-class Flight:
-    origin: str
-    destination: str
-    departure_date: str
-    return_date: str
-    price_usd: float
-    airline: str
-    stops: str
-    duration: str
-    url: str
-    scraped_at: str
-
-# ─── Scraper ──────────────────────────────────────────────────────────────────
-
-def scrape_google_flights(origin: str) -> list[Flight]:
-    url = f"https://www.google.com/flights?hl=en&curr=USD#flt={origin}.MAD.{DEPARTURE_DATE}*MAD.{origin}.{RETURN_DATE};c:USD;e:1;sd:1;t:f"
-
-    log.info(f"Scraping Google Flights {origin} → {DESTINATION}")
-    log.info(f"URL: {url}")
-    flights = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
