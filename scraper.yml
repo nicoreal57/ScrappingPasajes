@@ -1,0 +1,75 @@
+name: Flight Price Scraper
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"  # Cada 2 horas (dentro del free tier de GitHub Actions)
+  workflow_dispatch:
+    inputs:
+      departure_date:
+        description: "Fecha de ida (YYYY-MM-DD)"
+        required: false
+        default: ""
+      return_date:
+        description: "Fecha de vuelta (YYYY-MM-DD)"
+        required: false
+        default: ""
+      price_threshold:
+        description: "Precio umbral en USD"
+        required: false
+        default: "1000"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
+      - name: Restore flights log
+        uses: actions/cache@v4
+        with:
+          path: flights_log.json
+          key: flights-log-${{ github.run_id }}
+          restore-keys: |
+            flights-log-
+
+      - name: Run scraper
+        env:
+          GMAIL_SENDER:    ${{ secrets.GMAIL_SENDER }}
+          GMAIL_PASSWORD:  ${{ secrets.GMAIL_PASSWORD }}
+          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
+          DEPARTURE_DATE:  ${{ github.event.inputs.departure_date  || vars.DEPARTURE_DATE  || '2025-07-15' }}
+          RETURN_DATE:     ${{ github.event.inputs.return_date     || vars.RETURN_DATE     || '2025-07-30' }}
+          PRICE_THRESHOLD: ${{ github.event.inputs.price_threshold || vars.PRICE_THRESHOLD || '1000' }}
+        run: python src/scraper.py
+
+      - name: Upload debug HTML on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html-${{ github.run_id }}
+          path: debug_*.html
+          retention-days: 3
+
+      - name: Upload flights log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flights-log-${{ github.run_id }}
+          path: flights_log.json
+          if-no-files-found: ignore
+          retention-days: 30
